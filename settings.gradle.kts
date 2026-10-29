@@ -135,6 +135,7 @@ include(":mcp-server")
 include(":plugins:idp-basic")
 include(":plugins:k8s-job-executor")
 include(":plugins:maintenance")
+include(":plugins:semantic-query-planner")
 include(
   ":maintenance:maintenance-common",
   ":maintenance:optimizer-api",
