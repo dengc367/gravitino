@@ -19,7 +19,8 @@
 
 # Design of the Semantic Query Plan Contract
 
-Status: draft for review. This document describes a contract, not an implementation.
+Status: contract settled for implementation. Every open question has a recorded decision in
+[Decisions](#decisions); the implementation has not started.
 
 ## Background
 
@@ -58,7 +59,10 @@ dialect-neutral logical plan; the engine that will execute the query materialize
    exposes the join graph but does not claim fan-out safety.
 4. **Optimization.** No projection pushdown, predicate pushdown, join reordering or cost model.
    The consuming engine does that on its own logical plan.
-5. **Version pinning.** The current definition is planned; see the open questions.
+5. **Serving historical versions.** The plan is resolved against the current definition and records
+   the version it used so that a consumer can detect drift. Resolving an explicit historical
+   snapshot, and enforcing pinning at execution time, are future work; see
+   [Version binding](#4-version-binding).
 6. **A recursive plan tree.** Single-block metric queries do not need one; see
    [Alternatives considered](#alternatives-considered).
 
@@ -154,9 +158,8 @@ public final class SemanticQueryPlan {
   /** The complete identifier of the Semantic Model the plan was resolved against. */
   public NameIdentifier semanticModel();
 
-  /** The Semantic Model version the plan was resolved against, or {@code null} if unknown. */
-  @Nullable
-  public String semanticModelVersion();
+  /** The version of the definition the plan was resolved against; monotonic per model. */
+  public long semanticModelVersion();
 
   /** The datasets the query needs, in join order. */
   public List<PlanSource> sources();
@@ -348,6 +351,37 @@ The following parts of the prototype do not survive this contract:
 The REST path keeps its shape but changes meaning: `POST .../semantic-models/{semanticModel}/plan`
 returns a plan, not SQL.
 
+### 5. Version binding
+
+Every plan is resolved against exactly one definition snapshot, and that snapshot is recorded in
+`semanticModelVersion`. The version increases monotonically per Semantic Model and changes whenever
+the model is altered, so it is a conservative drift signal: a comment-only edit also bumps it, and
+a consumer may re-plan unnecessarily, but it never misses a definition change.
+
+The version exists so that a consumer can detect that a plan is stale:
+
+- A consumer that holds a plan SHOULD compare `semanticModelVersion` with the model's current
+  version before executing it, re-plan when they differ, and decide for itself whether a stale plan
+  is acceptable. The server does not revalidate plans, because it never sees the execution.
+- A plan is a statement about a definition, not about data. A source table can change under a
+  version number that has not changed, so a pinned version does not protect against DDL or data
+  drift on the physical sources. Consumers that need that protection must check the sources
+  themselves.
+- Resolution happens inside one snapshot read, so a plan is internally consistent even when an
+  alteration commits concurrently.
+
+Future extensions, deliberately outside this contract but compatible with it:
+
+- `POST .../semantic-models/{semanticModel}/versions/{version}/plan` to resolve a historical
+  snapshot.
+- A request-side `version` field that answers `409 Conflict` when it does not match the current
+  version, which is what makes the pin enforceable end to end.
+
+Implementation prerequisite: versions are already persisted per model (snapshot rows plus a
+per-model current-version pointer), but the loaded `SemanticModel` does not expose the current
+version today, so it has to be carried to the planning layer first; see
+[Mapping to the prototype](#mapping-to-the-prototype).
+
 ## Wire format
 
 ### Request
@@ -374,7 +408,7 @@ Resolved against a model with datasets `orders` (source `catalogA.dbB.order_tabl
   "code": 0,
   "plan": {
     "semanticModel": ["metalake", "catalogA", "sales", "sales_model"],
-    "semanticModelVersion": "3",
+    "semanticModelVersion": 3,
     "sources": [
       {"dataset": "orders", "source": ["catalogA", "dbB", "order_table"]},
       {"dataset": "regions", "source": ["catalogA", "dbB", "region_table"]}
@@ -452,6 +486,7 @@ Wire encoding notes:
 - `Expression` is an object from dialect identifier to expression text; it is exactly the model's
   dialect map, not a parsed tree.
 - `Role`, `Type`, `Operator` and `DataType` are the uppercase enum names.
+- `semanticModelVersion` is a JSON number, monotonically increasing per Semantic Model.
 - Nullable fields are omitted when absent; unknown enumeration values are rejected by DTO
   validation rather than ignored.
 
@@ -485,6 +520,8 @@ These rules are part of the contract because consumers and tests depend on them 
 9. **Limit.** A negative limit is a `400`; the plan echoes a non-negative limit unchanged.
 10. **Determinism.** The same request against the same model definition produces the same plan,
     including list order and join order.
+11. **Version.** The plan carries the version of the snapshot it resolved, read in the same
+    snapshot; the value is always present and never decreases for a model.
 
 ## Errors
 
@@ -497,6 +534,9 @@ These rules are part of the contract because consumers and tests depend on them 
 | `5XX` | Server error |
 
 `501` disappears together with the pluggable planner: the endpoint is always available.
+
+A request-side version selector is not part of this contract. When it is added, a version that is
+not the current one answers `409 Conflict`; today the response simply reports the version it used.
 
 ## Reference materialization (informative)
 
@@ -574,6 +614,7 @@ response stays dialect-neutral. Deferred so that the contract is settled first.
 | Prototype area | Change |
 | --- | --- |
 | `api/.../semantic/SemanticQuery{Plan,Planner,Filter}.java` | reshape as above; delete `PlanningContext` from the public contract |
+| `api/.../semantic/SemanticModel.java`, `core/.../meta/SemanticModelEntity.java` | expose the current committed version so the plan can carry it; today only the storage layer knows it |
 | `api/.../exceptions/SemanticQueryPlanException.java` | keep, still maps to `422` |
 | `core/.../SemanticQueryPlannerFactory.java`, `Configs.SEMANTIC_MODEL_QUERY_PLANNER` | delete |
 | `server/.../rest/SemanticModelOperations.java` | same path; resolve instead of compile |
@@ -582,22 +623,34 @@ response stays dialect-neutral. Deferred so that the contract is settled first.
 | client Java / Python / MCP | mechanical: `planSemanticQuery` returns the plan |
 | `plugins/semantic-query-planner` | becomes `plugins/semantic-query-converter` (reference Spark converter, library only) |
 
-## Open questions for reviewers
+## Decisions
 
-1. **Version pinning.** Should the plan carry `semanticModelVersion` now (and fail if the model
-   changes between plan and execute), or stay "current definition" until the API exposes versions?
-2. **Physical sources in the response.** Expose `Dataset.source` (as drafted), or expose dataset
-   names only and let the engine resolve them through its Gravitino connector? The latter is
-   cleaner for governance but makes the plan unusable without a Gravitino connection.
-3. **`limit` type.** `Long` (matches engine row limits) versus `int` (matches most APIs)?
-4. **Filter operators.** Ship `EQ/NE/GT/GE/LT/LE` only, or add `IN`, `NOT_IN`, `IS_NULL`,
-   `LIKE` in the first cut? The model has no nullability metadata today.
-5. **Detail queries.** A query with dimensions and no metric currently returns detail rows. Should
-   it instead be rejected, or grouped?
-6. **Naming.** `SemanticQueryPlan` (chosen) versus `SemanticExecutePlan` or
-   `SemanticQueryLogicalPlan`; and `plan` as the endpoint suffix.
-7. **Converter location.** SPI in `api` (drafted) versus `clients/client-java`, given that engine
-   adapters usually depend on a client library rather than the server API.
-8. **Response envelope.** Gravitino responses are flat (`code` plus fields). This draft nests the
-   plan under `plan` so a future materialized form can sit beside it. Keep the nesting, or flatten
-   the plan fields to the top level for consistency with the existing response DTOs?
+All contract questions are settled. Each decision is binding for the implementation; the rationale
+is kept so that later changes are argued against a stated reason instead of re-litigated.
+
+| # | Question | Decision and rationale |
+| --- | --- | --- |
+| 1 | Version pinning | The plan carries `semanticModelVersion` from the snapshot it resolved. A definition that changes between planning and execution silently invalidates a plan, so recording the version is the cheapest reliable drift signal and the prerequisite for a pinned-version endpoint later. See [Version binding](#5-version-binding). |
+| 2 | Physical sources | Expose the physical `NameIdentifier` of every source. Many consumers are not running inside Trino or Spark and hold no live Gravitino connection — a JDBC-only client must be able to turn the plan into SQL with nothing but the plan. |
+| 3 | `limit` type | `Long`. Distributed engines can legitimately page or export beyond `Integer.MAX_VALUE` rows, and widening the field later would be a Java API break. |
+| 4 | Filter operators | `EQ`, `NE`, `GT`, `GE`, `LT`, `LE` only. `IN` and `LIKE` literals are dialect-sensitive (some engines route `LIKE` through dedicated indexes), and the model has no nullability metadata, so they are deferred rather than guessed. |
+| 5 | Detail queries | A query with dimensions and no metric returns detail rows, without an implicit `DISTINCT`. Analysts use the semantic layer to pull raw samples, and a forced `DISTINCT` would turn a scan into a cluster-wide shuffle. |
+| 6 | Naming | `SemanticQueryPlan`, with `POST .../semantic-models/{semanticModel}/plan`. The name mirrors the path and describes a plan rather than an executable statement. |
+| 7 | Converter location | The SPI lives in `api`. Engine plugins such as a Trino connector are packaged inside the engine's lib directory and must not pull the full client and its network stack just to reference a converter interface. |
+| 8 | Response envelope | The plan is nested under `"plan"`. It reserves a sibling slot for a future optional `"materializedSql"` without breaking the top-level JSON shape, and keeps the plan's own namespace separate from the envelope. |
+
+## Deferred work
+
+These are compatible with the contract and deliberately left for follow-up changes:
+
+1. **Optional server-side materialization.** A `"materializedSql"` sibling produced by a configured
+   converter, for consumers that want the convenience without using the SPI. The canonical response
+   stays dialect-neutral.
+2. **Historical-version planning.** `.../semantic-models/{semanticModel}/versions/{version}/plan`
+   and a request-side `version` field answering `409 Conflict` on mismatch.
+3. **Richer filters.** `IN`, `NOT_IN`, `IS_NULL`, `LIKE`, once the model carries nullability and the
+   literal rendering rules for them are specified per dialect.
+4. **Fan-out and cardinality.** `Relationship` needs a cardinality, after which the plan can expose
+   fan-out annotations instead of forcing every hop to be an `INNER` join.
+5. **Additional relational operators.** `orderBy`, `having`, `distinct`, and multi-block plans for
+   queries that need a union or a subquery; all are additive fields on the current block.
